@@ -80,12 +80,12 @@ class CropperInteraction(Interaction):
         self.bounding_box = bounding_box # UN-PADDED
         unpad_prev_mask = unpad(self.prev_mask, pad)
         self.out_prob = unpad_prev_mask[:, :, ly:uy+1, lx:ux+1]
-        self.out_prob, self.pad = pad_divide_by(self.out_prob, 16, self.out_prob.shape[-2:])
+        self.out_prob, self.pad = pad_divide_by(self.out_prob, 16)
         self.out_mask = aggregate_sbg(self.out_prob, keep_bg=True)
 
         unpad_image = unpad(self.image, pad)
         self.im_crop = unpad_image[:, :, ly:uy+1, lx:ux+1]
-        self.im_crop, _ = pad_divide_by(self.im_crop, 16, self.im_crop.shape[-2:])
+        self.im_crop, _ = pad_divide_by(self.im_crop, 16)
 
     def can_undo(self):
         return False
@@ -159,7 +159,7 @@ class FreeInteraction(Interaction):
 
     def predict(self):
         self.out_prob = torch.from_numpy(self.drawn_map).float().cuda()
-        self.out_prob, _ = pad_divide_by(self.out_prob, 16, self.out_prob.shape[-2:])
+        self.out_prob, _ = pad_divide_by(self.out_prob, 16)
         self.out_mask = aggregate_sbg(self.out_prob, keep_bg=True)
         return self.out_mask
 
@@ -319,6 +319,7 @@ class ClickInteraction(Interaction):
             self.out_prob = self.prev_mask.clone()
         else:
             self.out_prob[self.tar_obj-1] = self.obj_mask
+        print(self.out_prob.shape)
         self.out_mask = aggregate_sbg(self.out_prob, keep_bg=True, hard=True)
         return self.out_mask
 

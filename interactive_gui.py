@@ -10,12 +10,13 @@ import os
 from os import path
 import functools
 from argparse import ArgumentParser
+from typing import List, Tuple
 
 import cv2
 from PIL import Image
 import numpy as np
 import torch
-from collections import deque
+from collections import defaultdict, deque
 
 from PyQt5.QtWidgets import (QWidget, QApplication, QComboBox, 
     QHBoxLayout, QLabel, QPushButton, QTextEdit, 
@@ -44,25 +45,43 @@ torch.set_grad_enabled(False)
 # DAVIS palette
 palette = pal_color_map()
 
+
+class ImageCache:
+
+    def __init__(self, image_paths: List[str]):
+        self.image_paths = image_paths
+        assert len(self) > 0, "No image paths provided"
+        self.h, self.w = self[0].shape[:2]
+
+    def __getitem__(self, idx: int) -> np.ndarray:
+        frame = cv2.imread(self.image_paths[idx])[..., ::-1]
+        return frame
+
+    def __len__(self) -> int:
+        return len(self.image_paths)
+
+    @property
+    def shape(self) -> Tuple[int, int, int]:
+        return (len(self), self.h, self.w)
+
+
 class App(QWidget):
     def __init__(self, prop_net, fuse_net, s2m_ctrl:S2MController, fbrs_ctrl:FBRSController, 
-                    images, masks, num_objects, mem_freq, mem_profile):
+                    images, num_objects, mem_freq, mem_profile):
         super().__init__()
 
-        self.images = images
-        self.masks = masks
+        # don't load all images, just paths
+        # create class that holds paths and by indexing reads images in one step
+        # as an inplace replacement
+        self.images = ImageCache(images)
         self.num_objects = num_objects
         self.s2m_controller = s2m_ctrl
         self.fbrs_controller = fbrs_ctrl
-        self.processor = InferenceCore(prop_net, fuse_net, images_to_torch(images, device='cpu'),
+        self.processor = InferenceCore(prop_net, fuse_net, images,
                          num_objects, mem_freq=mem_freq, mem_profile=mem_profile)
 
+        # reaplce
         self.num_frames, self.height, self.width = self.images.shape[:3]
-
-        # IOU computation
-        if self.masks is not None:
-            self.ious = np.zeros(self.num_frames)
-            self.iou_curve = []
 
         # set window
         self.setWindowTitle('MiVOS')
@@ -264,7 +283,6 @@ class App(QWidget):
 
         # initialize visualization
         self.viz_mode = 'davis'
-        self.current_mask = np.zeros((self.num_frames, self.height, self.width), dtype=np.uint8)
         self.vis_map = np.zeros((self.height, self.width, 3), dtype=np.uint8)
         self.vis_alpha = np.zeros((self.height, self.width, 1), dtype=np.float32)
         self.brush_vis_map = np.zeros((self.height, self.width, 3), dtype=np.uint8)
@@ -282,11 +300,9 @@ class App(QWidget):
 
         # Zoom parameters
         self.zoom_pixels = 150
-        
+
         # initialize action
-        self.interactions = {}
-        self.interactions['interact'] = [[] for _ in range(self.num_frames)]
-        self.interactions['annotated_frame'] = []
+        self.interactions = defaultdict(list)
         self.this_frame_interactions = []
         self.interaction = None
         self.reset_this_interaction()
@@ -334,12 +350,12 @@ class App(QWidget):
 
         for i in range(self.num_frames):
             # Save mask
-            mask = Image.fromarray(self.current_mask[i]).convert('P')
+            mask = Image.fromarray(self.processor.masks[i]).convert('P')
             mask.putpalette(palette)
             mask.save(os.path.join(mask_dir, '{:05d}.png'.format(i)))
 
             # Save overlay
-            overlay = overlay_davis(self.images[i], self.current_mask[i]) 
+            overlay = overlay_davis(self.images[i], self.processor.masks[i])
             overlay = Image.fromarray(overlay)
             overlay.save(os.path.join(overlay_dir, '{:05d}.png'.format(i)))
         self.console_push_text('Done.')
@@ -384,11 +400,14 @@ class App(QWidget):
                 raise NotImplementedError
         else:
             if self.viz_mode == 'fade':
-                self.viz = overlay_davis_fade(self.images[self.cursur], self.current_mask[self.cursur]) 
+                self.viz = overlay_davis_fade(self.images[self.cursur],
+                                              self.processor.masks[self.cursur])
             elif self.viz_mode == 'davis':
-                self.viz = overlay_davis(self.images[self.cursur], self.current_mask[self.cursur]) 
+                self.viz = overlay_davis(self.images[self.cursur],
+                                         self.processor.masks[self.cursur])
             elif self.viz_mode == 'light':
-                self.viz = overlay_davis(self.images[self.cursur], self.current_mask[self.cursur], 0.9)
+                self.viz = overlay_davis(self.images[self.cursur],
+                                         self.processor.masks[self.cursur], 0.9)
             else:
                 raise NotImplementedError
 
@@ -547,8 +566,8 @@ class App(QWidget):
 
         self.console_push_text('Propagation started.')
         # self.interacted_mask = torch.softmax(self.interacted_mask*1000, dim=0)
-        self.current_mask = self.processor.interact(self.interacted_mask, self.cursur, 
-                            self.progress_total_cb, self.progress_step_cb)
+        self.processor.interact(self.interacted_mask, self.cursur,
+                                self.progress_total_cb, self.progress_step_cb)
         self.interacted_mask = None
         # clear scribble and reset
         self.show_current_frame()
@@ -582,7 +601,7 @@ class App(QWidget):
         if self.timer.isActive():
             self.timer.stop()
         else:
-            self.timer.start(1000 / 25)
+            self.timer.start(1000 // 25)
 
     def on_undo(self):
         if self.in_local_mode:
@@ -613,7 +632,7 @@ class App(QWidget):
                     self.interacted_mask = self.this_frame_interactions[-1].predict()
                 else:
                     self.reset_this_interaction()
-                    self.interacted_mask = self.processor.prob[:, self.cursur].clone()
+                    self.interacted_mask = self.processor.prob[self.cursur].clone()
             else:
                 if self.interaction.can_undo():
                     self.interacted_mask = self.interaction.undo()
@@ -623,7 +642,7 @@ class App(QWidget):
                         self.interacted_mask = self.this_frame_interactions[-1].predict()
                     else:
                         self.reset_this_interaction()
-                        self.interacted_mask = self.processor.prob[:, self.cursur].clone()
+                        self.interacted_mask = self.processor.prob[self.cursur].clone()
 
             # Update visualization
             if len(self.vis_hist) > 0:
@@ -635,9 +654,7 @@ class App(QWidget):
 
     def on_reset(self):
         # DO not edit prob -- we still need the mask diff
-        self.processor.masks[self.cursur].zero_()
-        self.processor.np_masks[self.cursur].fill(0)
-        self.current_mask[self.cursur].fill(0)
+        self.processor.masks.reset(self.cursur)
         self.reset_this_interaction()
         self.show_current_frame()
 
@@ -669,8 +686,8 @@ class App(QWidget):
         if len(self.this_frame_interactions) > 0:
             prev_soft_mask = self.this_frame_interactions[-1].out_prob
         else:
-            prev_soft_mask = self.processor.prob[1:, self.cursur]
-        image = self.processor.images[:,self.cursur]
+            prev_soft_mask = self.processor.prob[self.cursur][1:]
+        image = self.processor.images[self.cursur]
 
         self.interaction = LocalInteraction(
             image, prev_soft_mask, (self.height, self.width), self.local_bb, 
@@ -743,12 +760,12 @@ class App(QWidget):
 
         # Initial info
         if len(self.this_local_interactions) == 0:
-            prev_soft_mask = self.processor.prob[1:, self.cursur]
+            prev_soft_mask = self.processor.prob[self.cursur][1:]
         else:
             prev_soft_mask = self.this_local_interactions[-1].out_prob
         self.local_interactions['bounding_box'] = self.local_bb
         self.local_interactions['cursur'] = self.cursur
-        init_interaction = CropperInteraction(self.processor.images[:,self.cursur], 
+        init_interaction = CropperInteraction(self.processor.images[self.cursur],
                                     prev_soft_mask, self.processor.pad, self.local_bb)
         self.local_interactions['interact'].append(init_interaction)
 
@@ -820,13 +837,13 @@ class App(QWidget):
                     if len(self.this_frame_interactions) > 0:
                         prev_soft_mask = self.this_frame_interactions[-1].out_prob
                     else:
-                        prev_soft_mask = self.processor.prob[1:, self.cursur]
+                        prev_soft_mask = self.processor.prob[self.cursur][1:]
                 else:
                     # Not used if the previous interaction is still valid
                     # Don't worry about stacking effects here
                     prev_soft_mask = self.interaction.out_prob
-                prev_hard_mask = self.processor.masks[self.cursur]
-                image = self.processor.images[:,self.cursur]
+                prev_hard_mask = self.processor.masks.get_torch(self.cursur)
+                image = self.processor.images[self.cursur]
                 h, w = self.height, self.width
 
             last_interaction = self.local_interaction if self.in_local_mode else self.interaction
@@ -893,7 +910,6 @@ class App(QWidget):
             self.local_np_mask = (max_mask.detach().cpu().numpy()[0]).astype(np.uint8)
         else:
             self.processor.update_mask_only(self.interacted_mask, self.cursur)
-            self.current_mask[self.cursur] = self.processor.np_masks[self.cursur]
         self.show_current_frame()
 
     def complete_interaction(self):
@@ -906,8 +922,7 @@ class App(QWidget):
         else:
             if self.interaction is not None:
                 self.clear_visualization()
-                self.interactions['annotated_frame'].append(self.cursur)
-                self.interactions['interact'][self.cursur].append(self.interaction)
+                self.interactions[self.cursur].append(self.interaction)
                 self.this_frame_interactions.append(self.interaction)
                 self.interaction = None
                 self.undo_button.setDisabled(False)
@@ -956,7 +971,6 @@ class App(QWidget):
         self.debug_mask, self.interacted_mask = self.interacted_mask, self.debug_mask
 
         self.processor.update_mask_only(self.interacted_mask, self.cursur)
-        self.current_mask[self.cursur] = self.processor.np_masks[self.cursur]
         self.show_current_frame()
 
     def wheelEvent(self, event):
@@ -981,7 +995,7 @@ if __name__ == '__main__':
     parser.add_argument('--video', help='Video file readable by OpenCV. Either this or --images needs to be specified.', default='example/example.mp4')
     parser.add_argument('--num_objects', help='Default: 1 if no masks provided, masks.max() otherwise', type=int)
     parser.add_argument('--mem_freq', default=5, type=int)
-    parser.add_argument('--mem_profile', default=0, type=int, help='0 - Faster and more memory intensive; 2 - Slower and less memory intensive. Default: 0.')
+    parser.add_argument('--mem_profile', default=3, type=int, help='2 - Faster and more memory intensive; 2 - Slower and less memory intensive. Default: 0.')
     parser.add_argument('--masks', help='Optional, ground truth masks', default=None)
     parser.add_argument('--no_amp', help='Turn off AMP', action='store_true')
     parser.add_argument('--resolution', help='Pass -1 to use original size', default=480, type=int)
@@ -1006,25 +1020,23 @@ if __name__ == '__main__':
             s2m_model = None
 
         # Loads the images/masks
-        if args.images is not None:
-            images = load_images(args.images, args.resolution if args.resolution > 0 else None)
-        elif args.video is not None:
-            images = load_video(args.video, args.resolution if args.resolution > 0 else None)
-        else:
-            raise NotImplementedError('You must specify either --images or --video!')
+        # if args.images is not None:
+        #     images = load_images(args.images, args.resolution if args.resolution > 0 else None)
+        # elif args.video is not None:
+        #     images = load_video(args.video, args.resolution if args.resolution > 0 else None)
+        # else:
+        #     raise NotImplementedError('You must specify either --images or --video!')
 
-        if args.masks is not None:
-            masks = load_masks(args.masks)
-        else:
-            masks = None
+        # scan images directory for paths
+        fnames = sorted(glob.glob(os.path.join(args.images, '*.jpg')))
+        if len(fnames) == 0:
+            fnames = sorted(glob.glob(os.path.join(args.images, '*.png')))
+        image_paths = fnames
 
         # Determine the number of objects
         num_objects = args.num_objects
         if num_objects is None:
-            if masks is not None:
-                num_objects = masks.max()
-            else:
-                num_objects = 1
+            num_objects = 1
 
         s2m_controller = S2MController(s2m_model, num_objects, ignore_class=255)
         if args.fbrs_model is not None:
@@ -1034,6 +1046,5 @@ if __name__ == '__main__':
 
         app = QApplication(sys.argv)
         ex = App(prop_model, fusion_model, s2m_controller, fbrs_controller, 
-                    images, masks, num_objects, args.mem_freq, args.mem_profile)
+                 image_paths, num_objects, args.mem_freq, args.mem_profile)
         sys.exit(app.exec_())
-

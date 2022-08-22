@@ -3,7 +3,7 @@ import torch.nn.functional as F
 
 def aggregate_sbg(prob, keep_bg=False, hard=False):
     device = prob.device
-    k, _, h, w = prob.shape
+    k, h, w = prob.shape
     ex_prob = torch.zeros((k+1, 1, h, w), device=device)
     ex_prob[0] = 0.5
     ex_prob[1:] = prob

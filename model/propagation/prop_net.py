@@ -185,7 +185,7 @@ class PropagationNetwork(nn.Module):
         return W
 
     def get_attention(self, mk16, pos_mask, neg_mask, qk16):
-        b, _, h, w = pos_mask.shape
+        b, h, w = pos_mask.shape[1:]
         nh = h//16
         nw = w//16
 
