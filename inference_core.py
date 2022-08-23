@@ -93,13 +93,15 @@ class MaskCache:
         if not isinstance(mask, (np.ndarray, torch.Tensor)):
             raise RuntimeError(f"Mask is an unsupported type: {type(mask)}")
         if isinstance(mask, torch.Tensor):
-            mask = mask.squeeze().cpu().numpy()
+            mask = mask.squeeze().byte().cpu().numpy()
             if self.pad[2] + self.pad[3] > 0:
                 mask = mask[self.pad[2]:-self.pad[3],]
             if self.pad[0] + self.pad[1] > 0:
                 mask = mask[:,self.pad[0]:-self.pad[1]]
         assert mask.shape[-2:] == (self.height, self.width)
-        cv2.imwrite(mask_path, mask)
+        success = cv2.imwrite(mask_path, mask)
+        if not success:
+            raise RuntimeError(f"Couldn't save mask: {mask_path}")
 
     def __len__(self) -> int:
         return self.num_masks
@@ -244,7 +246,8 @@ class InferenceCore:
             # Flush buffer
             if len(self.query_buf) > self.q_buf_size:
                 self.query_buf = {}
-            self.query_buf[idx] = self.prop_net.get_query_values(self.get_image_buffered(idx))
+            self.query_buf[idx] = self.prop_net.get_query_values(
+                self.get_image_buffered(idx))
 
         return self.query_buf[idx]
 
@@ -319,7 +322,8 @@ class InferenceCore:
             if (closest_ti != self.t) and (closest_ti != -1):
                 self.prob.update(ti,
                                  self.fuse_one_frame(
-                                     closest_ti, idx, ti, self.prob[ti],
+                                     closest_ti, idx, ti,
+                                     self.prob[ti].unsqueeze(1),
                                      out_mask, key_k, query[3]
                                  )
                                 )
@@ -342,11 +346,18 @@ class InferenceCore:
         nr = abs(tr-ti) / abs(tc-tr)
         dist = torch.FloatTensor([nc, nr]).to(self.device).unsqueeze(0)
         for k in range(1, self.k+1):
-            attn_map = self.prop_net.get_attention(mk16[k-1:k], self.pos_mask_diff[k:k+1], self.neg_mask_diff[k:k+1], qk16)
+            attn_map = self.prop_net.get_attention(
+                mk16[k-1:k],
+                self.pos_mask_diff[k:k+1],
+                self.neg_mask_diff[k:k+1],
+                qk16)
 
-            w = torch.sigmoid(self.fuse_net(self.get_image_buffered(ti), 
-                    prev_mask[k:k+1].to(self.device), curr_mask[k:k+1].to(self.device), attn_map, dist))
-            prob[k-1] = w 
+            w = torch.sigmoid(self.fuse_net(self.get_image_buffered(ti),
+                    prev_mask[k:k+1].to(self.device),
+                    curr_mask[k:k+1].to(self.device),
+                    attn_map,
+                    dist))
+            prob[k-1] = w
         return aggregate_wbg(prob, keep_bg=True)
 
     def interact(self, mask, idx, total_cb=None, step_cb=None):

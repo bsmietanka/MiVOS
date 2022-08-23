@@ -78,7 +78,8 @@ class App(QWidget):
         self.s2m_controller = s2m_ctrl
         self.fbrs_controller = fbrs_ctrl
         self.processor = InferenceCore(prop_net, fuse_net, images,
-                         num_objects, mem_freq=mem_freq, mem_profile=mem_profile)
+                         num_objects, mem_freq=mem_freq, mem_profile=mem_profile,
+                         device="cpu")
 
         # reaplce
         self.num_frames, self.height, self.width = self.images.shape[:3]
@@ -1004,11 +1005,11 @@ if __name__ == '__main__':
     with torch.cuda.amp.autocast(enabled=not args.no_amp):
         # Load our checkpoint
         prop_saved = torch.load(args.prop_model)
-        prop_model = PropagationNetwork().cuda().eval()
+        prop_model = PropagationNetwork().eval()
         prop_model.load_state_dict(prop_saved)
 
         fusion_saved = torch.load(args.fusion_model)
-        fusion_model = FusionNet().cuda().eval()
+        fusion_model = FusionNet().eval()
         fusion_model.load_state_dict(fusion_saved)
 
         # Loads the S2M model
@@ -1045,6 +1046,6 @@ if __name__ == '__main__':
             fbrs_controller = None
 
         app = QApplication(sys.argv)
-        ex = App(prop_model, fusion_model, s2m_controller, fbrs_controller, 
+        ex = App(prop_model, fusion_model, s2m_controller, fbrs_controller,
                  image_paths, num_objects, args.mem_freq, args.mem_profile)
         sys.exit(app.exec_())

@@ -123,7 +123,7 @@ class FreeInteraction(Interaction):
         selected.append((x, y))
         if len(selected) >= 2:
             for i in range(self.K):
-                self.drawn_map[i,0] = cv2.line(self.drawn_map[i,0], 
+                self.drawn_map[i] = cv2.line(self.drawn_map[i],
                     (int(round(selected[-2][0])), int(round(selected[-2][1]))),
                     (int(round(selected[-1][0])), int(round(selected[-1][1]))),
                     int((i+1)==k), thickness=self.size)
@@ -319,7 +319,6 @@ class ClickInteraction(Interaction):
             self.out_prob = self.prev_mask.clone()
         else:
             self.out_prob[self.tar_obj-1] = self.obj_mask
-        print(self.out_prob.shape)
         self.out_mask = aggregate_sbg(self.out_prob, keep_bg=True, hard=True)
         return self.out_mask
 
