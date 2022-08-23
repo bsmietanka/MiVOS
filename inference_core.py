@@ -35,7 +35,9 @@ class TorchImageCache:
         self.orig_height, self.orig_width = cv2.imread(self.image_paths[0]).shape[:2]
 
     def __getitem__(self, idx: int) -> torch.Tensor:
-        frame = cv2.imread(self.image_paths[idx])[None] # load and add batch dimension
+        # load and add batch dimension
+        frame = cv2.cvtColor(cv2.imread(self.image_paths[idx]),
+                             cv2.COLOR_BGR2RGB)[None]
         torch_imgs = images_to_torch(frame, self.dev)[0]
         torch_imgs, pad_array = pad_divide_by(torch_imgs,
                                               self.divide_by)

@@ -65,9 +65,12 @@ class ImageCache:
         return (len(self), self.h, self.w)
 
 
+# TODO: ADD maskCache, probCache, move it to some common file
+# to share between interactive_gui.py and inference_core.py
+
 class App(QWidget):
     def __init__(self, prop_net, fuse_net, s2m_ctrl:S2MController, fbrs_ctrl:FBRSController, 
-                    images, num_objects, mem_freq, mem_profile):
+                    images: List[str], num_objects, mem_freq, mem_profile):
         super().__init__()
 
         self.images = ImageCache(images)
@@ -566,6 +569,7 @@ class App(QWidget):
 
         self.console_push_text('Propagation started.')
         # self.interacted_mask = torch.softmax(self.interacted_mask*1000, dim=0)
+        # NOTE: make sure there are no simultaneous writes on masks or probs
         self.processor.interact(self.interacted_mask, self.cursur, 
                                 self.progress_total_cb, self.progress_step_cb)
         self.interacted_mask = None
