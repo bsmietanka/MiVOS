@@ -45,6 +45,7 @@ torch.set_grad_enabled(False)
 palette = pal_color_map()
 
 
+# TODO: add fixed length buffers for faster access times
 class ImageCache:
 
     def __init__(self, image_paths: List[str]):
@@ -73,6 +74,10 @@ class App(QWidget):
         self.num_objects = num_objects
         self.s2m_controller = s2m_ctrl
         self.fbrs_controller = fbrs_ctrl
+        # with full separation - don't create it here
+        # just call docker wrapper with appropriate parameters for processing
+        # and create images/probs/masks caches here
+        # So: get rid of all self.processor... calls
         self.processor = InferenceCore(prop_net, fuse_net, images,
                          num_objects, mem_freq=mem_freq, mem_profile=mem_profile,
                          device="cpu") # modified for low resource machine purposes

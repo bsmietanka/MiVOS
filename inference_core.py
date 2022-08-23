@@ -20,8 +20,7 @@ from util.tensor_util import pad_divide_by, unpad
 
 
 
-# remember about updating tensors on disk
-# images are not modified but masks and probs are
+# TODO: add fixed length buffers for faster access times
 class TorchImageCache:
 
     def __init__(self, image_paths: List[str], divide_by: int = 16,
@@ -209,6 +208,7 @@ class InferenceCore:
         self.pad = self.images.pad_array
 
         # These two store the same information in different formats
+        # TODO?: configuration of segmentation "project" directory structure
         shutil.rmtree("temp")
         self.masks = MaskCache("temp/masks", t, h, w, 16, "cpu", self.pad)
 
