@@ -4,15 +4,150 @@ Handles propagation and fusion
 See eval_semi_davis.py / eval_interactive_davis.py for examples
 """
 
+import os
+import shutil
+from typing import List, Tuple, Union
 import torch
 import numpy as np
 import cv2
+from interact.interactive_utils import images_to_torch
 
 from model.propagation.prop_net import PropagationNetwork
 from model.fusion_net import FusionNet
 from model.aggregate import aggregate_sbg, aggregate_wbg
 
-from util.tensor_util import pad_divide_by
+from util.tensor_util import pad_divide_by, unpad
+
+
+
+# remember about updating tensors on disk
+# images are not modified but masks and probs are
+class TorchImageCache:
+
+    def __init__(self, image_paths: List[str], divide_by: int = 16,
+                 dev: str = "cpu"):
+        self.image_paths = image_paths
+        self.divide_by = divide_by
+        self.dev = dev
+        assert len(self) > 0
+        self.pad_array = None
+        self.channels, self.height, self.width = self[0].shape[-3:]
+        assert self.pad_array is not None
+        self.orig_height, self.orig_width = cv2.imread(self.image_paths[0]).shape[:2]
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        frame = cv2.imread(self.image_paths[idx])[None] # load and add batch dimension
+        torch_imgs = images_to_torch(frame, self.dev)[0]
+        torch_imgs, pad_array = pad_divide_by(torch_imgs,
+                                              self.divide_by)
+        if self.pad_array is None:
+            self.pad_array = pad_array
+        return torch_imgs
+
+    def __len__(self) -> int:
+        return len(self.image_paths)
+
+    @property
+    def shape(self) -> Tuple[int, int, int, int]:
+        return (len(self.image_paths), self.channels, self.height, self.width)
+
+    @property
+    def original_shape(self) -> Tuple[int, int, int, int]:
+        return (len(self.image_paths), self.channels, self.orig_height, self.orig_width)
+
+
+class MaskCache:
+
+    def __init__(self, root: str, num_masks: int, height: int, width: int,
+                 divide_by: int = 16, dev: str = "cpu", pad = None):
+        self.root = root
+        os.makedirs(self.root, exist_ok=True)
+        self.num_masks = num_masks
+        self.height = height
+        self.width = width
+        self.divide_by = divide_by
+        self.dev = dev
+        if pad is None:
+            self.pad = (0, 0, 0, 0)
+        else:
+            self.pad = pad
+
+    def __mask_path(self, idx: int) -> str:
+        return os.path.join(self.root, f"{idx}.png")
+
+    def __getitem__(self, idx: int) -> np.ndarray:
+        assert idx < self.num_masks
+        mask_path = self.__mask_path(idx)
+        if not os.path.exists(mask_path):
+            return np.zeros((self.height, self.width), np.uint8)
+        return cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+
+    @torch.no_grad()
+    def get_torch(self, idx: int) -> torch.ByteTensor:
+        mask = torch.ByteTensor(self[idx])
+        return pad_divide_by(mask, self.divide_by)[0].unsqueeze(0)
+
+    @torch.no_grad()
+    def update(self, idx: int, mask: Union[np.ndarray, torch.Tensor]) -> None:
+        assert idx < self.num_masks
+        mask_path = self.__mask_path(idx)
+        if not isinstance(mask, (np.ndarray, torch.Tensor)):
+            raise RuntimeError(f"Mask is an unsupported type: {type(mask)}")
+        if isinstance(mask, torch.Tensor):
+            mask = mask.byte().cpu().numpy()
+            mask = unpad(mask, self.pad)
+        mask = mask.reshape((self.height, self.width))
+        success = cv2.imwrite(mask_path, mask)
+        if not success:
+            raise RuntimeError(f"Couldn't save mask: {mask_path}")
+
+    def __len__(self) -> int:
+        return self.num_masks
+
+    def reset(self, idx: int):
+        zero_mask = np.zeros((self.height, self.width), np.uint8)
+        self.update(idx, zero_mask)
+
+
+class TorchProbsCache:
+
+    def __init__(self, root: str, num_objects: int, num_masks: int,
+                 height: int, width: int, dev: str = "cpu"):
+        self.root = root
+        os.makedirs(self.root, exist_ok=True)
+        self.num_objects = num_objects
+        # actual number of objects including background
+        self._num_obj = num_objects + 1
+        self.num_masks = num_masks
+        self.height = height
+        self.width = width
+        self.dev = dev
+
+    def __prob_path(self, idx: int) -> str:
+        return os.path.join(self.root, f"{idx}.pt")
+
+    @torch.no_grad()
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        assert idx < self.num_masks
+        prob_path = self.__prob_path(idx)
+        if not os.path.exists(prob_path):
+            # singular dimension for compatibility with previous shapes
+            probs = torch.zeros((self._num_obj, 1, self.height, self.width),
+                               device=self.dev)
+            probs[0] = 1e-7
+            return probs
+        return torch.load(prob_path)
+
+    def __len__(self) -> int:
+        return self.num_masks
+
+    @torch.no_grad()
+    def update(self, idx: int, probs: torch.Tensor) -> None:
+        assert idx < self.num_masks
+        prob_path = self.__prob_path(idx)
+        probs = probs.reshape((self._num_obj, 1, self.height, self.width))
+        torch.save(probs.cpu(), prob_path)
+
 
 class InferenceCore:
     """
@@ -63,29 +198,29 @@ class InferenceCore:
             self.i_buf_size = 1
 
         # True dimensions
-        t = images.shape[1]
-        h, w = images.shape[-2:]
         self.k = num_objects
 
         # Pad each side to multiples of 16
-        self.images, self.pad = pad_divide_by(images, 16, images.shape[-2:])
+        self.images = TorchImageCache(images, 16, self.data_dev)
         # Padded dimensions
         nh, nw = self.images.shape[-2:]
-        self.images = self.images.to(self.data_dev, non_blocking=False)
+        h, w = self.images.original_shape[-2:]
+        t = len(self.images)
+        self.pad = self.images.pad_array
 
         # These two store the same information in different formats
-        self.masks = torch.zeros((t, 1, nh, nw), dtype=torch.uint8, device=self.result_dev)
-        self.np_masks = np.zeros((t, h, w), dtype=np.uint8)
+        shutil.rmtree("temp")
+        self.masks = MaskCache("temp/masks", t, h, w, 16, "cpu", self.pad)
 
         # Object probabilities, background included
-        self.prob = torch.zeros((self.k+1, t, 1, nh, nw), dtype=torch.float32, device=self.result_dev)
-        self.prob[0] = 1e-7
+        self.prob = TorchProbsCache("temp/probs", self.k, t, nh, nw, "cpu")
 
         self.t, self.h, self.w = t, h, w
         self.nh, self.nw = nh, nw
-        self.kh = self.nh//16
-        self.kw = self.nw//16
+        self.kh = self.nh // 16
+        self.kw = self.nw // 16
 
+        # TODO: replace with deque?
         self.query_buf = {}
         self.image_buf = {}
         self.interacted = set()
@@ -94,18 +229,14 @@ class InferenceCore:
         self.certain_mem_v = None
 
     def get_image_buffered(self, idx):
-        if self.data_dev == self.device:
-            return self.images[:,idx]
-
         # buffer the .cuda() calls
         if idx not in self.image_buf:
             # Flush buffer
             if len(self.image_buf) > self.i_buf_size:
                 self.image_buf = {}
-        self.image_buf[idx] = self.images[:,idx].to(self.device)
-        result = self.image_buf[idx]
+            self.image_buf[idx] = self.images[idx].to(self.device)
 
-        return result
+        return self.image_buf[idx]
 
     def get_query_kv_buffered(self, idx):
         # Queries' key/value never change, so we can buffer them here
@@ -113,11 +244,10 @@ class InferenceCore:
             # Flush buffer
             if len(self.query_buf) > self.q_buf_size:
                 self.query_buf = {}
+            self.query_buf[idx] = self.prop_net.get_query_values(
+                self.get_image_buffered(idx))
 
-            self.query_buf[idx] = self.prop_net.get_query_values(self.get_image_buffered(idx))
-        result = self.query_buf[idx]
-
-        return result
+        return self.query_buf[idx]
 
     def do_pass(self, key_k, key_v, idx, forward=True, step_cb=None):
         """
@@ -188,10 +318,13 @@ class InferenceCore:
             # In-place fusion, maximizes the use of queried buffer
             # esp. for long sequence where the buffer will be flushed
             if (closest_ti != self.t) and (closest_ti != -1):
-                self.prob[:,ti] = self.fuse_one_frame(closest_ti, idx, ti, self.prob[:,ti], out_mask, 
-                                        key_k, query[3]).to(self.result_dev)
+                self.prob.update(ti,
+                                 self.fuse_one_frame(closest_ti, idx, ti,
+                                                     self.prob[ti], out_mask,
+                                                     key_k, query[3])
+                                 )
             else:
-                self.prob[:,ti] = out_mask.to(self.result_dev)
+                self.prob.update(ti, out_mask)
 
             # Callback function for the GUI
             if step_cb is not None:
@@ -230,11 +363,11 @@ class InferenceCore:
 
         mask = mask.to(self.device)
         mask, _ = pad_divide_by(mask, 16, mask.shape[-2:])
-        self.mask_diff = mask - self.prob[:, idx].to(self.device)
+        self.mask_diff = mask - self.prob[idx].to(self.device)
         self.pos_mask_diff = self.mask_diff.clamp(0, 1)
         self.neg_mask_diff = (-self.mask_diff).clamp(0, 1)
 
-        self.prob[:, idx] = mask
+        self.prob.update(idx, mask)
         key_k, key_v = self.prop_net.memorize(self.get_image_buffered(idx), mask[1:])
 
         if self.certain_mem_k is None:
@@ -257,18 +390,7 @@ class InferenceCore:
         
         # This is a more memory-efficient argmax
         for ti in range(self.t):
-            self.masks[ti] = torch.argmax(self.prob[:,ti], dim=0)
-        out_masks = self.masks
-
-        # Trim paddings
-        if self.pad[2]+self.pad[3] > 0:
-            out_masks = out_masks[:,:,self.pad[2]:-self.pad[3],:]
-        if self.pad[0]+self.pad[1] > 0:
-            out_masks = out_masks[:,:,:,self.pad[0]:-self.pad[1]]
-
-        self.np_masks = (out_masks.detach().cpu().numpy()[:,0]).astype(np.uint8)
-
-        return self.np_masks
+            self.masks.update(ti, torch.argmax(self.prob[ti], dim=0))
 
     def update_mask_only(self, prob_mask, idx):
         """
@@ -279,15 +401,4 @@ class InferenceCore:
         Return: all mask results in np format for DAVIS evaluation
         """
         mask = torch.argmax(prob_mask, 0)
-        self.masks[idx] = mask
-
-        # Mask - 1 * H * W
-        if self.pad[2]+self.pad[3] > 0:
-            mask = mask[:,self.pad[2]:-self.pad[3],:]
-        if self.pad[0]+self.pad[1] > 0:
-            mask = mask[:,:,self.pad[0]:-self.pad[1]]
-
-        mask = (mask.detach().cpu().numpy()[0]).astype(np.uint8)
-        self.np_masks[idx] = mask
-
-        return self.np_masks
+        self.masks.update(idx, mask)
